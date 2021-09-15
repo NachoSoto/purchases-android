@@ -9,6 +9,7 @@ import android.net.Uri
 import com.revenuecat.purchases.PurchaserInfo
 import com.revenuecat.purchases.PurchasesError
 import com.revenuecat.purchases.PurchasesErrorCode
+import com.revenuecat.purchases.strings.NetworkStrings
 import com.revenuecat.purchases.common.attribution.AttributionNetwork
 import org.json.JSONException
 import org.json.JSONObject
@@ -34,6 +35,10 @@ typealias OfferingsCallback = Pair<(JSONObject) -> Unit, (PurchasesError) -> Uni
 typealias PostReceiptDataSuccessCallback = (PurchaserInfo, body: JSONObject) -> Unit
 /** @suppress */
 typealias PostReceiptDataErrorCallback = (PurchasesError, shouldConsumePurchase: Boolean, body: JSONObject?) -> Unit
+/** @suppress */
+typealias CreateAliasCallback = Pair<() -> Unit, (PurchasesError) -> Unit>
+/** @suppress */
+typealias IdentifyCallback = Pair<(PurchaserInfo, Boolean) -> Unit, (PurchasesError) -> Unit>
 
 class Backend(
     private val apiKey: String,
@@ -51,6 +56,12 @@ class Backend(
 
     @get:Synchronized @set:Synchronized
     @Volatile var offeringsCallbacks = mutableMapOf<String, MutableList<OfferingsCallback>>()
+
+    @get:Synchronized @set:Synchronized
+    @Volatile var createAliasCallbacks = mutableMapOf<CallbackCacheKey, MutableList<CreateAliasCallback>>()
+
+    @get:Synchronized @set:Synchronized
+    @Volatile var identifyCallbacks = mutableMapOf<CallbackCacheKey, MutableList<IdentifyCallback>>()
 
     fun close() {
         this.dispatcher.close()
@@ -309,7 +320,11 @@ class Backend(
         onSuccessHandler: () -> Unit,
         onErrorHandler: (PurchasesError) -> Unit
     ) {
-        enqueue(object : Dispatcher.AsyncCall() {
+        val cacheKey = listOfNotNull(
+            appUserID,
+            newAppUserID
+        )
+        val call = object : Dispatcher.AsyncCall() {
             override fun call(): HTTPClient.Result {
                 return httpClient.performRequest(
                     "/subscribers/" + encode(appUserID) + "/alias",
@@ -319,17 +334,32 @@ class Backend(
             }
 
             override fun onError(error: PurchasesError) {
-                onErrorHandler(error)
+                synchronized(this@Backend) {
+                    createAliasCallbacks.remove(cacheKey)
+                }?.forEach { (_, onErrorHandler) ->
+                    onErrorHandler(error)
+                }
             }
 
             override fun onCompletion(result: HTTPClient.Result) {
                 if (result.isSuccessful()) {
-                    onSuccessHandler()
+                    synchronized(this@Backend) {
+                        createAliasCallbacks.remove(cacheKey)
+                    }?.forEach { (onSuccessHandler, _) ->
+                        onSuccessHandler()
+                    }
                 } else {
-                    onErrorHandler(result.toPurchasesError().also { errorLog(it) })
+                    synchronized(this@Backend) {
+                        createAliasCallbacks.remove(cacheKey)
+                    }?.forEach { (_, onErrorHandler) ->
+                        onErrorHandler(result.toPurchasesError().also { errorLog(it) })
+                    }
                 }
             }
-        })
+        }
+        synchronized(this@Backend) {
+            createAliasCallbacks.addCallback(call, cacheKey, onSuccessHandler to onErrorHandler)
+        }
     }
 
     fun logIn(
@@ -338,7 +368,11 @@ class Backend(
         onSuccessHandler: (PurchaserInfo, Boolean) -> Unit,
         onErrorHandler: (PurchasesError) -> Unit
     ) {
-        enqueue(object : Dispatcher.AsyncCall() {
+        val cacheKey = listOfNotNull(
+            appUserID,
+            newAppUserID
+        )
+        val call = object : Dispatcher.AsyncCall() {
             override fun call(): HTTPClient.Result {
                 return httpClient.performRequest(
                     "/subscribers/identify",
@@ -351,24 +385,39 @@ class Backend(
             }
 
             override fun onError(error: PurchasesError) {
-                onErrorHandler(error)
+                synchronized(this@Backend) {
+                    identifyCallbacks.remove(cacheKey)
+                }?.forEach { (_, onErrorHandler) ->
+                    onErrorHandler(error)
+                }
             }
 
             override fun onCompletion(result: HTTPClient.Result) {
                 if (result.isSuccessful()) {
-                    val created = result.responseCode == HTTP_STATUS_CREATED
-                    if (result.body.length() > 0) {
-                        val purchaserInfo = result.body.buildPurchaserInfo()
-                        onSuccessHandler(purchaserInfo, created)
-                    } else {
-                        onErrorHandler(PurchasesError(PurchasesErrorCode.UnknownError)
-                            .also { errorLog(it) })
+                    synchronized(this@Backend) {
+                        identifyCallbacks.remove(cacheKey)
+                    }?.forEach { (onSuccessHandler, onErrorHandler) ->
+                        val created = result.responseCode == HTTP_STATUS_CREATED
+                        if (result.body.length() > 0) {
+                            val purchaserInfo = result.body.buildPurchaserInfo()
+                            onSuccessHandler(purchaserInfo, created)
+                        } else {
+                            onErrorHandler(PurchasesError(PurchasesErrorCode.UnknownError)
+                                .also { errorLog(it) })
+                        }
                     }
                 } else {
-                    onErrorHandler(result.toPurchasesError().also { errorLog(it) })
+                    synchronized(this@Backend) {
+                        identifyCallbacks.remove(cacheKey)
+                    }?.forEach { (_, onErrorHandler) ->
+                        onErrorHandler(result.toPurchasesError().also { errorLog(it) })
+                    }
                 }
             }
-        })
+        }
+        synchronized(this@Backend) {
+            identifyCallbacks.addCallback(call, cacheKey, onSuccessHandler to onErrorHandler)
+        }
     }
 
     private fun HTTPClient.Result.isSuccessful(): Boolean {
@@ -385,6 +434,7 @@ class Backend(
             this[cacheKey] = mutableListOf(functions)
             enqueue(call, randomDelay)
         } else {
+            debugLog(String.format(NetworkStrings.SAME_CALL_ALREADY_IN_PROGRESS, cacheKey))
             this[cacheKey]!!.add(functions)
         }
     }
